@@ -1,55 +1,56 @@
-// GodriadMedia Push Server - Makes calls ring + messages pop even when app is CLOSED
-// HOW TO USE:
-// 1. Upload this file to your server (Render / Railway / VPS) - NOT to Vercel static (Vercel cannot run a push server 24/7)
-// 2. In Firebase Console > Project Settings > Service Accounts > Generate new private key -> Save as serviceAccountKey.json in same folder
-// 3. In Firebase Console > Project Settings > Cloud Messaging > Web Push certificates > Generate key pair -> Copy VAPID public key
-//    Paste that VAPID public key into your app: localStorage.setItem('gm_vapid','YOUR_VAPID_PUBLIC_KEY')
-// 4. Run: npm install express web-push firebase-admin cors
-// 5. Run: node server.js  (or deploy to Render/Railway with Start Command: node server.js)
-// 6. In your app, set: fetch('/api/push/...') must point to YOUR server URL, e.g. https://godriad-push.onrender.com/api/push/send
-// WITHOUT this server + FCM keys, the app can ONLY notify when it is OPEN. No code can ring a fully-closed web app without a push server - that is how Facebook/WhatsApp do it too.
-const express = require('express');
-const cors = require('cors');
-const webpush = require('web-push');
-const admin = require('firebase-admin');
-const app = express();
-app.use(cors()); app.use(express.json());
-let serviceAccount = null;
-try { serviceAccount = require('./serviceAccountKey.json'); } catch(e){ console.log('No serviceAccountKey.json yet - FCM for Android native will be off, Web Push still works if VAPID set'); }
-if (serviceAccount) { admin.initializeApp({ credential: admin.credential.cert(serviceAccount) }); }
-// TODO: Paste your VAPID keys here (from Firebase > Cloud Messaging > Web Push certificates)
-const VAPID_PUBLIC = process.env.VAPID_PUBLIC || 'PASTE_YOUR_VAPID_PUBLIC_KEY_HERE';
-const VAPID_PRIVATE = process.env.VAPID_PRIVATE || 'PASTE_YOUR_VAPID_PRIVATE_KEY_HERE';
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:godriadmedia@gmail.com';
-if (VAPID_PUBLIC.startsWith('PASTE')) console.log('⚠️ Set VAPID keys - see top of server.js');
-else webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
-const subs = new Map(); // userName -> {sub, phone}
-app.post('/api/push/subscribe', (req,res)=>{
-  const {user, phone, sub} = req.body||{};
-  if(!user||!sub) return res.status(400).json({ok:false, error:'user + sub required'});
-  subs.set(String(user).toLowerCase(), {sub, phone:phone||''});
-  console.log('Subscribed:', user);
-  return res.json({ok:true});
-});
-app.post('/api/push/send', async (req,res)=>{
-  const {type, to, title, body, data} = req.body||{};
-  if(!to) return res.status(400).json({ok:false, error:'to required'});
-  const entry = subs.get(String(to).toLowerCase());
-  const payload = JSON.stringify({title:title||'GodriadMedia', body:body||'New activity', type:type||'message', data:data||{}, url:'https://godriadmedia.vercel.app/'});
-  // 1. Web Push (works when browser is closed but phone is on, if user allowed notifications)
-  if (entry && entry.sub) {
-    try { await webpush.sendNotification(entry.sub, payload); console.log('Web Push sent to', to, type); }
-    catch(e){ console.log('Web Push failed for', to, e.message); if(e.statusCode===410||e.statusCode===404) subs.delete(String(to).toLowerCase()); }
+// GodriadMedia Push Server - ZERO DEPENDENCY version (Cannot fail with MODULE_NOT_FOUND)
+// Uses ONLY Node built-in 'http' - no express, no cors, no firebase-admin, no npm install needed.
+// Build Command in Render: leave EMPTY or 'npm install' (does nothing, no deps)
+// Start Command in Render: node server.js
+// This server WILL go Live. After it is Live, we add FCM via Firebase REST (also no npm) in next step.
+const http = require('http');
+const { URL } = require('url');
+
+// In-memory: user -> {fcmToken, phone, lastSeen}
+const tokens = new Map();
+
+function sendJson(res, code, obj){
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});
+  res.end(body);
+}
+function readBody(req){
+  return new Promise((resolve)=>{
+    let d='';
+    req.on('data',c=>{d+=c; if(d.length>1000000) req.destroy();});
+    req.on('end',()=>{ try{ resolve(d?JSON.parse(d):{}); }catch(e){ resolve({}); } });
+  });
+}
+
+const server = http.createServer(async (req,res)=>{
+  const url = new URL(req.url, 'http://localhost');
+  // CORS preflight
+  if(req.method==='OPTIONS'){
+    res.writeHead(200, {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});
+    return res.end();
   }
-  // 2. FCM for Android native (if you later wrap app with Capacitor / Play Store)
-  if (serviceAccount) {
-    try {
-      await admin.messaging().send({ topic:'godriad_'+String(to).toLowerCase().replace(/[^a-z0-9]/g,'_'), notification:{title:title||'GodriadMedia', body:body||'New activity'}, data:{type:String(type||'message'), click_action:'FLUTTER_NOTIFICATION_CLICK'} });
-      console.log('FCM sent to', to);
-    } catch(e){ console.log('FCM failed (user may not be subscribed to topic):', e.message); }
+  if(req.method==='GET' && (url.pathname==='/' || url.pathname==='/health')){
+    return sendJson(res,200,{ok:true, msg:'GodriadMedia Push Server (ZERO-DEP) is running âœ…', users: tokens.size, fcm:'pending-next-step', version:'zero-dep-v1'});
   }
-  return res.json({ok:true, sentTo:to, via: entry?'web-push':'queued'});
+  if(req.method==='POST' && url.pathname==='/api/push/subscribe'){
+    const body = await readBody(req);
+    const user = String(body.user||'').toLowerCase();
+    if(!user) return sendJson(res,400,{ok:false, error:'user required'});
+    if(body.fcmToken) tokens.set(user,{fcmToken:body.fcmToken, phone:body.phone||'', lastSeen:Date.now()});
+    console.log('Subscribed:', user, 'total:', tokens.size);
+    return sendJson(res,200,{ok:true, total:tokens.size});
+  }
+  if(req.method==='POST' && url.pathname==='/api/push/send'){
+    const body = await readBody(req);
+    const to = String(body.to||'').toLowerCase();
+    if(!to) return sendJson(res,400,{ok:false, error:'to required'});
+    console.log('Push request:', body.type||'message', '->', to, 'title:', body.title||'GodriadMedia');
+    // For now: log + return ok. App-open notification via Realtime Database still works.
+    // Next step (after Live): we add FCM REST send here using FIREBASE_SERVICE_ACCOUNT env var, still with zero npm deps.
+    return sendJson(res,200,{ok:true, via:'realtime-only-zero-dep', to, note:'Server is Live. FCM when closed = next step, no npm needed.'});
+  }
+  return sendJson(res,404,{ok:false, error:'not found', path:url.pathname});
 });
-app.get('/', (req,res)=> res.send('GodriadMedia Push Server is running ✅ - POST /api/push/subscribe and /api/push/send'));
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, ()=> console.log('GodriadMedia Push Server on port', PORT));
+server.listen(PORT, ()=> console.log('GodriadMedia Push Server (ZERO-DEP) on port', PORT));
